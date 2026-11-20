@@ -5,19 +5,19 @@
 // ============================================================
 
 // ---------- AYARLAR ----------
-$api_key = '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';
+$api_key = 'nvidia apinizi girin';
 $model   = 'nvidia/nemotron-3.5-bolt-e4b';
 $api_url = 'https://integrate.api.nvidia.com/v1/chat/completions';
 
 $app_password = 'Aslan1905';
 
-$ftp_host   = 'ftp.cemmerterence.com';
-$ftp_user   = 'cemmert';
-$ftp_pass   = 'Aslan1905';
+$ftp_host   = 'ftp.siteadiniz.com';
+$ftp_user   = '';
+$ftp_pass   = '';
 $ftp_port   = 21;
 $ftp_ssl    = false;
 $ftp_dir    = 'public_html/bot-kodlar';
-$public_url = 'https://cemmertenence.com/bot-kodlar/';
+$public_url = 'https://siteadiniz.com/bot-kodlar/';
 
 $allowed_ext = ['php','html','htm','css','js','json','py','txt','md','sql','xml','sh'];
 
