@@ -1,0 +1,508 @@
+<?php
+// ============================================================
+// api/index.php — Nemotron 3.5 Bolt E4B + otomatik FTP yükleme
+// Vercel (vercel-php runtime) uyarlaması — çerez tabanlı parola
+// ============================================================
+
+// ---------- AYARLAR ----------
+$api_key = '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';
+$model   = 'nvidia/nemotron-3.5-bolt-e4b';
+$api_url = 'https://integrate.api.nvidia.com/v1/chat/completions';
+
+$app_password = 'Aslan1905';
+
+$ftp_host   = 'ftp.cemmerterence.com';
+$ftp_user   = 'cemmert';
+$ftp_pass   = 'Aslan1905';
+$ftp_port   = 21;
+$ftp_ssl    = false;
+$ftp_dir    = 'public_html/bot-kodlar';
+$public_url = 'https://cemmertenence.com/bot-kodlar/';
+
+$allowed_ext = ['php','html','htm','css','js','json','py','txt','md','sql','xml','sh'];
+
+$system_prompt = "Sen yardımcı bir kodlama asistanısın. Türkçe yanıt ver. "
+    . "Kod yazarken her dosyayı ayrı bir kod bloğunda ver ve bloğun açılış satırında dil ile dosya adını şu biçimde yaz: ```php:dosya.php "
+    . "(örnek: ```html:index.php değil ```html:index.html). Dosya adında yalnızca harf, rakam, nokta, tire ve alt çizgi kullan. "
+    . "Dosyaların sunucuya yüklenmesi ve link verilmesi otomatik yapılır, bunu sen söyleme veya yapmaya çalışma.";
+
+// ---------- YARDIMCILAR ----------
+function check_auth(string $pw): bool {
+    if ($pw === '') return true;
+    return hash_equals($pw, $_SERVER['HTTP_X_AUTH'] ?? '');
+}
+
+function sse_error(string $msg, string $detail = ''): void {
+    echo "data: " . json_encode(['error' => $msg, 'detail' => $detail], JSON_UNESCAPED_UNICODE) . "\n\n";
+    @ob_flush();
+    flush();
+}
+
+function json_fail(int $code, string $msg): void {
+    http_response_code($code);
+    echo json_encode(['error' => $msg], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+function ftp_mkdir_p($conn, string $path): bool {
+    foreach (explode('/', trim($path, '/')) as $seg) {
+        if ($seg === '' || $seg === '.' || $seg === '..') continue;
+        if (!@ftp_chdir($conn, $seg)) {
+            if (!@ftp_mkdir($conn, $seg)) return false;
+            if (!@ftp_chdir($conn, $seg)) return false;
+        }
+    }
+    return true;
+}
+
+// ---------- SOHBET (akış) ----------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_GET['action'] ?? '') === 'chat') {
+    @ini_set('zlib.output_compression', '0');
+    @ini_set('output_buffering', '0');
+    while (ob_get_level() > 0) { ob_end_flush(); }
+    @set_time_limit(0);
+
+    header('Content-Type: text/event-stream; charset=utf-8');
+    header('Cache-Control: no-cache');
+    header('X-Accel-Buffering: no');
+
+    if (!check_auth($app_password)) { sse_error('Yetkisiz', 'Parola yanlış.'); exit; }
+
+    if (strpos($api_key, 'nvapi-') !== 0) {
+        sse_error('API anahtarı geçersiz görünüyor', 'Anahtar "nvapi-" ile başlamalı.');
+        exit;
+    }
+
+    $input = json_decode(file_get_contents('php://input'), true);
+    $history = is_array($input['messages'] ?? null) ? $input['messages'] : [];
+
+    $messages = [['role' => 'system', 'content' => $system_prompt]];
+    $user_count = 0;
+    foreach (array_slice($history, -20) as $m) {
+        $role = $m['role'] ?? '';
+        $content = $m['content'] ?? '';
+        if (in_array($role, ['user', 'assistant'], true) && is_string($content) && $content !== '') {
+            $messages[] = ['role' => $role, 'content' => $content];
+            if ($role === 'user') $user_count++;
+        }
+    }
+    if ($user_count === 0 || end($messages)['role'] !== 'user') {
+        sse_error('Mesaj boş olamaz');
+        exit;
+    }
+
+    $payload = [
+        'model'       => $model,
+        'messages'    => $messages,
+        'temperature' => 1,
+        'top_p'       => 0.95,
+        'max_tokens'  => 4096,
+        'stream'      => true,
+        'chat_template_kwargs' => ['enable_thinking' => false],
+    ];
+
+    $http_code = 0;
+    $err_body  = '';
+
+    $ch = curl_init($api_url);
+    curl_setopt_array($ch, [
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => json_encode($payload, JSON_UNESCAPED_UNICODE),
+        CURLOPT_HTTPHEADER     => [
+            'Authorization: Bearer ' . $api_key,
+            'Content-Type: application/json',
+            'Accept: text/event-stream',
+        ],
+        CURLOPT_RETURNTRANSFER => false,
+        CURLOPT_HEADER         => false,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_TIMEOUT        => 240,
+        CURLOPT_HEADERFUNCTION => function ($ch, $header) use (&$http_code) {
+            if (preg_match('/^HTTP\/\S+\s+(\d+)/', $header, $m)) {
+                $http_code = (int)$m[1];
+            }
+            return strlen($header);
+        },
+        CURLOPT_WRITEFUNCTION  => function ($ch, $data) use (&$http_code, &$err_body) {
+            if ($http_code >= 400) {
+                $err_body .= $data;
+            } else {
+                echo $data;
+                @ob_flush();
+                flush();
+            }
+            return strlen($data);
+        },
+    ]);
+
+    curl_exec($ch);
+    $curl_error = curl_error($ch);
+    curl_close($ch);
+
+    if ($curl_error) {
+        sse_error('cURL hatası', $curl_error);
+    } elseif ($http_code >= 400) {
+        sse_error("HTTP {$http_code}", mb_substr($err_body, 0, 1000));
+    }
+    exit;
+}
+
+// ---------- FTP YÜKLEME ----------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_GET['action'] ?? '') === 'upload') {
+    header('Content-Type: application/json; charset=utf-8');
+
+    if (!check_auth($app_password)) json_fail(401, 'Yetkisiz');
+    if (!function_exists('ftp_connect')) json_fail(500, 'Sunucuda PHP FTP eklentisi kapalı.');
+
+    $in = json_decode(file_get_contents('php://input'), true);
+    $files = is_array($in['files'] ?? null) ? array_slice($in['files'], 0, 10) : [];
+    if (!$files) json_fail(400, 'Yüklenecek dosya yok.');
+
+    $clean = [];
+    foreach ($files as $f) {
+        $name = preg_replace('/[^A-Za-z0-9._-]/', '_', basename((string)($f['name'] ?? '')));
+        $name = ltrim($name, '.');
+        $content = (string)($f['content'] ?? '');
+        $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+        if ($name === '' || !in_array($ext, $allowed_ext, true)) continue;
+        if ($content === '' || strlen($content) > 300000) continue;
+        $clean[] = ['name' => $name, 'content' => $content];
+    }
+    if (!$clean) json_fail(400, 'Geçerli dosya bulunamadı (uzantı izinli listede değil veya içerik boş/çok büyük).');
+
+    $conn = $ftp_ssl ? @ftp_ssl_connect($ftp_host, $ftp_port, 20) : @ftp_connect($ftp_host, $ftp_port, 20);
+    if (!$conn) json_fail(502, 'FTP sunucusuna bağlanılamadı.');
+    if (!@ftp_login($conn, $ftp_user, $ftp_pass)) { ftp_close($conn); json_fail(502, 'FTP girişi başarısız (kullanıcı/şifre).'); }
+    ftp_pasv($conn, true);
+
+    $folder = date('Ymd-His') . '-' . bin2hex(random_bytes(3));
+    if (!ftp_mkdir_p($conn, $ftp_dir . '/' . $folder)) {
+        ftp_close($conn);
+        json_fail(502, 'FTP klasörü oluşturulamadı: ' . $ftp_dir);
+    }
+
+    $links = [];
+    $failed = [];
+    foreach ($clean as $f) {
+        $stream = fopen('php://temp', 'r+');
+        fwrite($stream, $f['content']);
+        rewind($stream);
+        $ok = @ftp_fput($conn, $f['name'], $stream, FTP_BINARY);
+        fclose($stream);
+        if ($ok) {
+            $links[] = ['name' => $f['name'], 'url' => rtrim($public_url, '/') . '/' . $folder . '/' . rawurlencode($f['name'])];
+        } else {
+            $failed[] = $f['name'];
+        }
+    }
+    ftp_close($conn);
+
+    echo json_encode(['links' => $links, 'failed' => $failed], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+?>
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hızlı Chat — Nemotron Bolt E4B</title>
+<style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        background: #0f0f12; color: #e4e4e7; min-height: 100vh;
+        display: flex; justify-content: center; padding: 20px;
+    }
+    .container { width: 100%; max-width: 860px; display: flex; flex-direction: column; height: calc(100vh - 40px); }
+    h1 { font-size: 20px; font-weight: 600; margin-bottom: 16px; color: #fff; }
+    h1 span { font-size: 14px; font-weight: 400; color: #71717a; }
+    #chat-box {
+        flex: 1; overflow-y: auto; padding: 16px; background: #18181b;
+        border-radius: 12px; border: 1px solid #27272a;
+        display: flex; flex-direction: column; gap: 12px; margin-bottom: 12px;
+    }
+    .msg { padding: 10px 14px; border-radius: 10px; line-height: 1.6; white-space: pre-wrap; word-wrap: break-word; }
+    .msg.user { background: #2563eb; color: #fff; align-self: flex-end; max-width: 85%; }
+    .msg.assistant { background: #27272a; color: #e4e4e7; align-self: flex-start; max-width: 90%; }
+    .msg.error { background: #450a0a; color: #fca5a5; border: 1px solid #7f1d1d; align-self: flex-start; max-width: 90%; font-size: 13px; }
+    .msg.links { background: #052e16; color: #bbf7d0; border: 1px solid #166534; align-self: flex-start; max-width: 90%; font-size: 14px; }
+    .msg.links a { color: #86efac; word-break: break-all; }
+    .input-row { display: flex; gap: 8px; }
+    #user-input {
+        flex: 1; padding: 12px 16px; border-radius: 10px; border: 1px solid #27272a;
+        background: #18181b; color: #e4e4e7; font-size: 15px; outline: none;
+    }
+    #user-input:focus { border-color: #2563eb; }
+    button { padding: 12px 20px; border-radius: 10px; border: none; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer; }
+    #send-btn { background: #2563eb; }
+    #send-btn:hover { background: #1d4ed8; }
+    #send-btn:disabled { background: #27272a; color: #52525b; cursor: not-allowed; }
+    #clear-btn { background: #27272a; }
+    #clear-btn:hover { background: #3f3f46; }
+    .status { font-size: 12px; color: #71717a; margin-top: 6px; min-height: 18px; }
+    .footer { margin-top: 14px; text-align: center; font-size: 13px; color: #71717a; }
+    .footer a { color: #60a5fa; text-decoration: none; }
+    .footer a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="container">
+    <h1>⚡ Hızlı Chat <span>nemotron-3.5-bolt-e4b · kodlar otomatik FTP'ye yüklenir</span></h1>
+    <div id="chat-box"></div>
+    <div class="input-row">
+        <input id="user-input" type="text" placeholder="Mesajınızı yazın..." autocomplete="off">
+        <button id="send-btn">Gönder</button>
+        <button id="clear-btn" title="Sohbeti temizle">Temizle</button>
+    </div>
+    <div class="status" id="status"></div>
+    <div class="footer">
+        <a href="https://github.com/ucretsizyazilimlar/kisiselbot" target="_blank" rel="noopener noreferrer">
+            github.com/ucretsizyazilimlar/kisiselbot
+        </a>
+    </div>
+</div>
+
+<script>
+(function () {
+    const chatBox = document.getElementById('chat-box');
+    const input = document.getElementById('user-input');
+    const sendBtn = document.getElementById('send-btn');
+    const clearBtn = document.getElementById('clear-btn');
+    const statusEl = document.getElementById('status');
+
+    const EXT_MAP = { javascript: 'js', js: 'js', python: 'py', py: 'py', php: 'php', html: 'html', htm: 'htm',
+        css: 'css', json: 'json', sql: 'sql', xml: 'xml', markdown: 'md', md: 'md', text: 'txt', txt: 'txt' };
+    const SKIP_LANGS = ['bash', 'sh', 'shell', 'console', 'terminal', 'zsh'];
+    const ALLOWED_EXT = ['php','html','htm','css','js','json','py','txt','md','sql','xml','sh'];
+
+    let history = [];
+
+    // ---------- Çerez yardımcıları ----------
+    function setCookie(name, value, days) {
+        const d = new Date();
+        d.setTime(d.getTime() + days * 24 * 60 * 60 * 1000);
+        const secure = location.protocol === 'https:' ? '; Secure' : '';
+        document.cookie = name + '=' + encodeURIComponent(value)
+            + '; expires=' + d.toUTCString()
+            + '; path=/; SameSite=Lax' + secure;
+    }
+    function getCookie(name) {
+        const m = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=([^;]*)'));
+        return m ? decodeURIComponent(m[1]) : null;
+    }
+    function delCookie(name) {
+        document.cookie = name + '=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/; SameSite=Lax';
+    }
+
+    function getPassword(force) {
+        let pw = getCookie('pw');
+        if (pw === null || force) {
+            pw = prompt('Parola (çerezde 7 gün saklanır):') || '';
+            if (pw === '') delCookie('pw');
+            else setCookie('pw', pw, 7);
+        }
+        return pw;
+    }
+    function authHeaders() {
+        return { 'Content-Type': 'application/json', 'X-Auth': getPassword(false) };
+    }
+
+    function addMsg(cls, text) {
+        const div = document.createElement('div');
+        div.className = 'msg ' + cls;
+        div.textContent = text;
+        chatBox.appendChild(div);
+        chatBox.scrollTop = chatBox.scrollHeight;
+        return div;
+    }
+    function showError(msg) { addMsg('error', '⚠ ' + msg); }
+
+    function extractFiles(text) {
+        const files = [];
+        const re = /```([^\n]*)\n([\s\S]*?)```/g;
+        let m, n = 0;
+        const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+        while ((m = re.exec(text)) !== null) {
+            const info = m[1].trim();
+            const content = m[2].replace(/\s+$/, '') + '\n';
+            if (!content.trim()) continue;
+            const parts = info.split(/[:\s]+/).filter(Boolean);
+            const lang = (parts[0] || '').toLowerCase();
+            let name = parts[1] || '';
+            n++;
+            if (name) {
+                name = name.replace(/[^A-Za-z0-9._-]/g, '_');
+                const ext = (name.split('.').pop() || '').toLowerCase();
+                if (!ALLOWED_EXT.includes(ext)) name = '';
+            }
+            if (!name) {
+                if (SKIP_LANGS.includes(lang)) continue;
+                const ext = EXT_MAP[lang] || 'txt';
+                name = 'kod-' + stamp + '-' + n + '.' + ext;
+            }
+            files.push({ name: name, content: content });
+        }
+        return files;
+    }
+
+    function makeDownloadLink(file) {
+        const blob = new Blob([file.content], { type: 'application/octet-stream' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = file.name;
+        a.textContent = '⬇ İndir';
+        return a;
+    }
+
+    function renderResult(files, data, errMsg) {
+        const box = document.createElement('div');
+        box.className = 'msg links';
+        box.appendChild(document.createTextNode(errMsg ? '⚠ Sunucuya yüklenemedi (' + errMsg + '), ama indirebilirsin:' : '✅ Dosyalar hazır:'));
+        const urls = {};
+        ((data && data.links) || []).forEach(l => { urls[l.name] = l.url; });
+        files.forEach(f => {
+            box.appendChild(document.createElement('br'));
+            box.appendChild(document.createTextNode('📄 ' + f.name + '  '));
+            box.appendChild(makeDownloadLink(f));
+            if (urls[f.name]) {
+                box.appendChild(document.createTextNode('  ·  '));
+                const o = document.createElement('a');
+                o.href = urls[f.name]; o.target = '_blank'; o.rel = 'noopener';
+                o.textContent = '🔗 Sunucudaki link';
+                box.appendChild(o);
+            }
+        });
+        if (data && data.failed && data.failed.length) {
+            box.appendChild(document.createElement('br'));
+            box.appendChild(document.createTextNode('❌ FTP\'ye yüklenemeyen: ' + data.failed.join(', ')));
+        }
+        chatBox.appendChild(box);
+        chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    async function uploadFiles(files) {
+        statusEl.textContent = 'Sunucuya yükleniyor…';
+        try {
+            const res = await fetch('?action=upload', {
+                method: 'POST',
+                headers: authHeaders(),
+                body: JSON.stringify({ files: files })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.status === 401) { delCookie('pw'); }
+            if (!res.ok || data.error) {
+                renderResult(files, null, data.error || ('HTTP ' + res.status));
+                return;
+            }
+            renderResult(files, data, null);
+        } catch (e) {
+            renderResult(files, null, e.message);
+        } finally {
+            statusEl.textContent = '';
+        }
+    }
+
+    async function sendMessage() {
+        const text = input.value.trim();
+        if (!text) return;
+
+        input.value = '';
+        sendBtn.disabled = true;
+        statusEl.textContent = 'Yanıt bekleniyor…';
+
+        addMsg('user', text);
+        history.push({ role: 'user', content: text });
+        const box = addMsg('assistant', '…');
+
+        let answer = '';
+        let hadError = false;
+
+        try {
+            const res = await fetch('?action=chat', {
+                method: 'POST',
+                headers: authHeaders(),
+                body: JSON.stringify({ messages: history })
+            });
+
+            if (!res.ok) {
+                showError('Sunucu hatası: HTTP ' + res.status);
+                box.remove();
+                history.pop();
+                return;
+            }
+
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            const handleLine = (line) => {
+                line = line.trim();
+                if (!line.startsWith('data:')) return;
+                const dataStr = line.slice(5).trim();
+                if (!dataStr || dataStr === '[DONE]') return;
+
+                let data;
+                try { data = JSON.parse(dataStr); } catch (e) { return; }
+
+                if (data.error) {
+                    hadError = true;
+                    const err = typeof data.error === 'string' ? data.error : JSON.stringify(data.error);
+                    if (err === 'Yetkisiz') delCookie('pw');
+                    showError(err + (data.detail ? ' — ' + data.detail : ''));
+                    return;
+                }
+                const delta = data.choices?.[0]?.delta;
+                if (delta?.content) {
+                    answer += delta.content;
+                    box.textContent = answer;
+                    chatBox.scrollTop = chatBox.scrollHeight;
+                }
+            };
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop();
+                lines.forEach(handleLine);
+            }
+            if (buffer) handleLine(buffer);
+
+            if (answer) {
+                history.push({ role: 'assistant', content: answer });
+                const files = extractFiles(answer);
+                if (files.length) await uploadFiles(files);
+            } else {
+                box.remove();
+                history.pop();
+                if (!hadError) showError('API boş yanıt döndürdü.');
+            }
+            statusEl.textContent = '';
+        } catch (err) {
+            console.error(err);
+            showError('Bağlantı hatası: ' + err.message);
+            box.remove();
+            history.pop();
+            statusEl.textContent = '';
+        } finally {
+            sendBtn.disabled = false;
+            input.focus();
+        }
+    }
+
+    sendBtn.addEventListener('click', sendMessage);
+    clearBtn.addEventListener('click', () => {
+        history = [];
+        chatBox.innerHTML = '';
+        input.focus();
+    });
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+    });
+    input.focus();
+})();
+</script>
+</body>
+</html>
